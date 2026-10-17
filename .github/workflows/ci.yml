@@ -1,0 +1,68 @@
+name: test
+on:
+  push:
+  pull_request:
+jobs:
+  goal-logic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: pnpm install --no-frozen-lockfile
+      - run: pnpm run build
+      - run: pnpm test
+      - run: bash scripts/version.sh check
+      - run: bash tests/version-rules.sh
+
+  windows-pwsh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install PowerShell
+        run: |
+          wget -q https://packages.microsoft.com/config/ubuntu/$(grep VERSION_ID /etc/os-release | cut -d '"' -f 2)/packages-microsoft-prod.deb
+          sudo dpkg -i packages-microsoft-prod.deb
+          sudo apt-get update && sudo apt-get install -y powershell
+      - run: pnpm install --no-frozen-lockfile
+      - run: pnpm run build
+      - run: node tests/windows-pwsh.mjs pwsh
+
+  windows-toast:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: pnpm install --no-frozen-lockfile
+      - run: pnpm run build
+      - run: node tests/windows-pwsh.mjs powershell
+
+  macos-notify:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: brew install terminal-notifier
+      - run: pnpm install --no-frozen-lockfile
+      - run: pnpm run build
+      - run: node tests/macos-notify.mjs

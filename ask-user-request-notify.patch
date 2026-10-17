@@ -1,0 +1,127 @@
+--- src/index.ts	2026-09-15 19:52:28.421145900 +0800
++++ /c/Users/17124/dsh-turn-notify-fixed/src/index.ts	2026-09-15 20:00:55.710493300 +0800
+@@ -101,6 +101,10 @@
+   questionTitleTemplate: string
+   questionBodyTemplate: string
+   questionSoundFile: string
++  notifyOnAskUser: boolean
++  askUserTitleTemplate: string
++  askUserBodyTemplate: string
++  askUserSoundFile: string
+   clickToFocus: boolean
+   webUrl: string
+   deepLinkHash: string
+@@ -142,6 +146,10 @@
+   questionTitleTemplate: Schema.string().default('{title}').description('提问通知标题模板，占位符 {title} {question} {sessionId}'),
+   questionBodyTemplate: Schema.string().default('提问：{question}').description('提问通知正文模板，占位符同上'),
+   questionSoundFile: Schema.string().default('').description('提问提示音文件；留空 = 与轮次结束共用 soundFile / 平台默认'),
++  notifyOnAskUser: Schema.boolean().default(true).description('agent 调用 ask_user_question 等待回答时也通知（默认开：这是真正的阻塞等待，不是自己的消息）'),
++  askUserTitleTemplate: Schema.string().default('{title}').description('ask_user_question 通知标题模板，占位符 {title} {question} {sessionId}'),
++  askUserBodyTemplate: Schema.string().default('提问：{question}').description('ask_user_question 通知正文模板，占位符同上'),
++  askUserSoundFile: Schema.string().default('').description('ask_user_question 专用提示音文件；留空 = 与轮次结束共用 soundFile / 平台默认'),
+   clickToFocus: Schema.boolean().default(true).description('点击通知卡片回到对应会话：Linux 与 Windows（balloon，页面在线时）复用已开页面、零新标签页；页面离线或 macOS 经 OS 深链打开浏览器直达会话'),
+   webUrl: Schema.string().default('http://127.0.0.1:3080').description('点击通知打开的 Web 地址（页面没开时的深链目标 base）'),
+   deepLinkHash: Schema.string().default('#dsh-focus=').description('深链 hash 前缀；页面侧客户端插件读取此 hash 定位会话'),
+@@ -225,6 +233,23 @@
+ /** 定向收窄：宿主侧 ambient 事件不在本包类型程序内。 */
+ type OnGoalChanged = (name: 'goal/changed', listener: (payload: GoalChangedPayload) => void) => unknown
+ 
++/**
++ * user-questions/request 事件的最小结构：事件声明在宿主侧
++ * @deepseek-ai/dsh-user-questions（peer 未发布类型时本包不引入），
++ * 此处按运行时字段收窄。
++ */
++interface AskUserRequestPayload {
++  agent?: Agent
++  questions?: Array<{ question?: unknown; header?: unknown }>
++}
++
++/** 定向收窄：user-questions/request 是宿主侧 ambient waterfall 事件。 */
++type OnAskUserRequest = (
++  name: 'user-questions/request',
++  listener: (request: AskUserRequestPayload, next: () => Promise<unknown>) => unknown,
++  options?: { prepend?: boolean },
++) => unknown
++
+ /** 从 user/message 的 content 块里拼接纯文本（只认 type === 'text'）。 */
+ function extractText(content: unknown): string {
+   if (!Array.isArray(content)) return ''
+@@ -239,6 +264,22 @@
+   return out.replace(/\s+/g, ' ').trim()
+ }
+ 
++/** 从 user-questions 请求里拼接问题文本（header 作前缀，多题用「；」连接）。 */
++function extractAskUserText(questions: unknown): string {
++  if (!Array.isArray(questions)) return ''
++  const parts: string[] = []
++  for (const raw of questions) {
++    if (raw === null || typeof raw !== 'object') continue
++    const item = raw as { question?: unknown; header?: unknown }
++    const question = typeof item.question === 'string' ? item.question : ''
++    const header = typeof item.header === 'string' && item.header.length > 0 ? item.header + ': ' : ''
++    if (question.length === 0 && header.length === 0) continue
++    // 通知正文保持单行；header 本身可能是含换行的长文本，统一折叠
++    parts.push(header + question)
++  }
++  return parts.join('；').replace(/\s+/g, ' ').trim()
++}
++
+ /** 按 Unicode 码点安全截前 n 字，超出补省略号。 */
+ function truncate(s: string, n: number): string {
+   const chars = Array.from(s)
+@@ -888,6 +929,47 @@
+   /** 每个 agent 的 running 起始时刻，用于 minRunMs 过滤。 */
+   const runningSince = new Map<string, number>()
+ 
++  /**
++   * ask_user_question：工具阻塞等真人回答时 agent 仍是 running，不会触发
++   * agent/status 的 idle；所以单独监听 user-questions/request 瀑布事件，
++   * 复用轮次结束的标题/正文/提示音通道。prepend 保证本监听最先跑，且一定会
++   * 调 next() 把回答权交给真正的 answerer（若排在 answerer 之后，answerer
++   * 直接返回结果会把瀑布短路，通知就丢了）。
++   */
++  const notifyAskUser = (request: AskUserRequestPayload): void => {
++    if (!config.notifyOnAskUser) return
++    const session = request.agent?.session
++    const sessionId = session === undefined ? '' : String(session.id)
++    const isRoot = session === undefined || session.header.parentSession === undefined
++    if (config.rootOnly && !isRoot) return
++    const question = extractAskUserText(request.questions)
++    const rawTitle = session === undefined ? config.fallbackTitle : resolveTitle(session, sessionId) ?? config.fallbackTitle
++    const rawBody =
++      config.questionChars > 0 && question.length > 0
++        ? truncate(question, config.questionChars)
++        : '等待你的回答'
++    const vars = { title: rawTitle, question: rawBody, sessionId }
++    const title = render(config.askUserTitleTemplate, vars)
++    const body = render(config.askUserBodyTemplate, vars)
++    // 命令类通道的占位符注入最终渲染值（与桌面通知显示一致）
++    const finalVars = { title, question: body, sessionId }
++    log('ask_user_question → 通知', 'title=' + title, 'question=' + body, 'session=' + sessionId, 'root=' + isRoot)
++    if (config.notifySend) sendDesktop(title, body, finalVars, config.askUserSoundFile)
++    if (config.sound && !windowsSystemAudioCovers(config.askUserSoundFile)) sendSound(finalVars, config.askUserSoundFile)
++    if (config.bell) process.stdout.write('\x07')
++    if (config.command) runShellCommand(platform, render(config.command, finalVars), (m) => warnOnce('command', m))
++  }
++
++  ;(ctx.on as unknown as OnAskUserRequest)('user-questions/request', (request, next) => {
++    try {
++      notifyAskUser(request)
++    } catch (error) {
++      // 通知通道故障绝不能打断提问瀑布。
++      warnOnce('ask-user', error instanceof Error ? error.message : String(error))
++    }
++    return next()
++  }, { prepend: true })
++
+   ctx.on('agent/status', ({ agent, status }: { agent: Agent; status: 'idle' | 'running' }) => {
+     const session = agent.session
+     const sessionId = String(session.id)
+@@ -947,6 +1029,7 @@
+   log('loaded; platform=' + (platform ?? 'unknown(' + process.platform + ')'), 'channels:', JSON.stringify({
+     notifySend: config.notifySend, sound: config.sound, bell: config.bell,
+     command: config.command ? '(custom)' : '(off)', rootOnly: config.rootOnly,
++    notifyOnAskUser: config.notifyOnAskUser,
+     questionChars: config.questionChars, skipGoalRounds: config.skipGoalRounds,
+     goalQuietMs: config.goalQuietMs,
+   }))
