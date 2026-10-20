@@ -295,9 +295,16 @@ function render(tpl: string, vars: { title: string; question: string; sessionId:
     .replaceAll('{sessionId}', vars.sessionId)
 }
 
-/** fire-and-forget 子进程：失败只经 onFail 上报，永不抛出。 */
-function run(cmd: string, args: string[], onFail: (msg: string) => void): void {
-  execFile(cmd, args, { timeout: 10_000 }, (err) => {
+/**
+ * fire-and-forget child process: failures are reported through onFail only.
+ * `verbatim` belongs to shell templates: `cmd /c <rendered line>` must reach cmd
+ * exactly as rendered. Otherwise Node escapes every `"` in the template as `\"`,
+ * which cmd and PowerShell read as a literal quote — the argument then splits at
+ * its first space, so a multi-word {title} arrives as its first word. The option
+ * has no effect outside Windows.
+ */
+function run(cmd: string, args: string[], onFail: (msg: string) => void, verbatim = false): void {
+  execFile(cmd, args, { timeout: 10_000, windowsVerbatimArguments: verbatim }, (err) => {
     if (err) onFail(err.message ?? String(err))
   })
 }
@@ -507,11 +514,11 @@ function detectPlatform(choice: PlatformChoice): Platform | undefined {
   return undefined
 }
 
-/** 在平台 shell 里执行命令模板。 */
+/** 在平台 shell 里执行命令模板（整行原样交给 shell，见 run 的 verbatim）。 */
 function runShellCommand(platform: Platform | undefined, cmd: string, onFail: (m: string) => void): void {
   const shell = platform === 'windows' ? 'cmd' : '/bin/sh'
   const flag = platform === 'windows' ? '/c' : '-c'
-  run(shell, [flag, cmd], onFail)
+  run(shell, [flag, cmd], onFail, true)
 }
 
 export function apply(ctx: Context, config: Config) {
